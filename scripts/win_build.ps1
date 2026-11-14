@@ -1,6 +1,7 @@
 #Requires -Version 5.1
 param(
-    [int]$Cores = 0
+    [int]$Cores = 0,
+    [string]$LlvmDir = ''
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -31,20 +32,35 @@ $UninstallKeys = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
 )
 
-:vsSearch foreach ($BaseKey in $UninstallKeys) {
+# Collect every Visual Studio installation that provides vcvars64.bat,
+# then prefer the newest one (e.g. VS 2026 over VS 2022)
+$VsCandidates = @()
+
+foreach ($BaseKey in $UninstallKeys) {
     foreach ($SubKey in (Get-ChildItem $BaseKey -ErrorAction SilentlyContinue)) {
         $DisplayName = $SubKey.GetValue('DisplayName', '')
         if ($DisplayName -like '*Visual Studio*') {
             $InstallLocation = $SubKey.GetValue('InstallLocation', '')
             if ($InstallLocation) {
+                $InstallLocation = $InstallLocation.Trim('"')
                 $Candidate = Join-Path $InstallLocation 'VC\Auxiliary\Build\vcvars64.bat'
                 if (Test-Path $Candidate) {
-                    $VsVarsPath = $Candidate
-                    break vsSearch
+                    $VsYear = 0
+                    if ($DisplayName -match '20(\d\d)') {
+                        $VsYear = [int]"20$($Matches[1])"
+                    }
+                    $VsCandidates += [PSCustomObject]@{
+                        Year = $VsYear
+                        Path = $Candidate
+                    }
                 }
             }
         }
     }
+}
+
+if ($VsCandidates.Count -gt 0) {
+    $VsVarsPath = ($VsCandidates | Sort-Object Year -Descending | Select-Object -First 1).Path
 }
 
 if (-not $VsVarsPath) {
@@ -145,8 +161,25 @@ if (-not (Test-Path $CacheFile)) {
     Write-Host "Qt6 Root: $QtRoot"
     Write-Host ''
 
+    # LLVM: either build from the git submodule (BUILD_LLVM=ON) or link against
+    # prebuilt static libs (RPCS3's llvmlibs_mt) via -LlvmDir <path to cmake\llvm>.
+    # The prebuilt libs are built with the static CRT (/MT), so the whole build
+    # must use MultiThreaded as well, and protobuf needs matching static runtime.
+    $LlvmArgs = @('-DBUILD_LLVM=ON')
+    if ($LlvmDir) {
+        $LlvmArgs = @(
+            '-DBUILD_LLVM=OFF',
+            "-DLLVM_DIR=$LlvmDir",
+            '-DSTATIC_LINK_LLVM=ON',
+            '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
+            '-Dprotobuf_MSVC_STATIC_RUNTIME=ON'
+        )
+    }
+
     & cmake $SourceDir -G 'Ninja Multi-Config' `
-        -DBUILD_LLVM=ON `
+        @LlvmArgs `
+        -DBUILD_RPCS3_TESTS=ON `
+        -DRUN_RPCS3_TESTS=ON `
         -DUSE_SYSTEM_OPENCV=OFF `
         -DUSE_SYSTEM_CURL=OFF `
         -DUSE_SYSTEM_ZLIB=OFF `
@@ -177,6 +210,10 @@ if (-not (Test-Path $CacheFile)) {
 Write-Host ''
 Write-Host "Building with $Cores cores..."
 
+# Add Qt bin to PATH so test executable can find Qt DLLs during gtest_discover_tests
+$QtBin = Join-Path $QtRoot 'bin'
+$env:PATH = "$QtBin;$env:PATH"
+
 & cmake --build $BuildDir --config Release --parallel $Cores
 
 if ($LASTEXITCODE -ne 0) {
@@ -189,6 +226,22 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ''
 Write-Host "Build complete! Output is in `"$BuildDir\bin\`""
+
+# ============================================================
+# Unit tests
+# ============================================================
+if (Test-Path (Join-Path $BuildDir 'bin\rpcs3_test.exe')) {
+    Write-Host ''
+    Write-Host 'Running unit tests...'
+
+    & ctest --test-dir $BuildDir -C Release --output-on-failure
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ''
+        Write-Warning 'Some unit tests failed!'
+    }
+}
+
 Print-Elapsed $StartTime
 Read-Host 'Press Enter to exit'
 exit 0
